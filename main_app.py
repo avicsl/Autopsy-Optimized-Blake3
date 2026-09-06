@@ -1,19 +1,19 @@
+import json
 import os
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from blake3_engine import (
-    benchmark_files_parallel,
-    gather_files,
-    get_simd_summary,
-    hash_file_baseline,
-    hash_file_optimized,
-    summarize_rows,
-    validate_consistency,
-    write_benchmark_csv,
-)
+# Add the dev folder to sys.path so we can import the new engine modules.
+_MODULE_DIR = Path(__file__).resolve().parent / "dev"
+if str(_MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(_MODULE_DIR))
+
+from optimized_blake3 import detected_simd_tier, hash_file  # noqa: E402
+from benchmark_blake3 import benchmark_files, _write_csv  # noqa: E402
 
 
 class Blake3HasherApp(tk.Tk):
@@ -25,11 +25,10 @@ class Blake3HasherApp(tk.Tk):
 
         self.file_path_var = tk.StringVar()
         self.hash_var = tk.StringVar(value="Hash will appear here")
-        simd_info = get_simd_summary()
+        simd_info = detected_simd_tier()
         self.status_var = tk.StringVar(value=f"SIMD: {simd_info} | Choose a file to hash")
         self.mode_var = tk.StringVar(value="optimized")
         self.repeats_var = tk.IntVar(value=3)
-        self.include_blake2_var = tk.BooleanVar(value=False)
 
         self._busy = False
 
@@ -80,12 +79,7 @@ class Blake3HasherApp(tk.Tk):
         repeats_box = ttk.Spinbox(bench_opts, from_=1, to=20, width=5, textvariable=self.repeats_var)
         repeats_box.pack(side="left", padx=(8, 12))
 
-        include_blake2 = ttk.Checkbutton(
-            bench_opts,
-            text="Include BLAKE2 baseline",
-            variable=self.include_blake2_var,
-        )
-        include_blake2.pack(side="left")
+        ttk.Label(bench_opts, text="(Compares BLAKE3 vs MD5/SHA-1/SHA-256)").pack(side="left")
 
         hash_frame = ttk.LabelFrame(container, text="BLAKE3 (hex)", padding=10)
         hash_frame.pack(fill="x", expand=False)
@@ -134,14 +128,19 @@ class Blake3HasherApp(tk.Tk):
     def _hash_file_worker(self, file_path: str) -> None:
         try:
             mode = self.mode_var.get()
-            if mode == "baseline":
-                metrics = hash_file_baseline(file_path)
-            else:
-                metrics = hash_file_optimized(file_path)
+            # "baseline" uses latency workload (single thread, fixed buffer);
+            # "optimized" uses the full adaptive/parallel profile.
+            workload = "latency" if mode == "baseline" else "balanced"
+            result = hash_file(file_path, workload=workload)
+            if result.status != "ok":
+                raise RuntimeError(result.error or "hashing failed")
 
             self.after(0, lambda: self._on_hash_success(
-                metrics.digest, metrics.elapsed_s, metrics.throughput_mb_s,
-                metrics.simd_tier, metrics.threads_used,
+                result.digest,
+                result.elapsed_ms / 1000.0,
+                result.throughput_mb_s,
+                result.simd_tier,
+                result.threads_used,
             ))
         except Exception as exc:
             self.after(0, lambda: self._on_hash_error(str(exc)))
@@ -188,75 +187,63 @@ class Blake3HasherApp(tk.Tk):
 
         worker = threading.Thread(
             target=self._benchmark_worker,
-            args=(dataset_dir, repeats, self.include_blake2_var.get()),
+            args=(dataset_dir, repeats),
             daemon=True,
         )
         worker.start()
 
-    def _benchmark_worker(self, dataset_dir: str, repeats: int, include_blake2: bool) -> None:
+    def _benchmark_worker(self, dataset_dir: str, repeats: int) -> None:
         try:
-            file_paths = gather_files(dataset_dir, recursive=True)
+            file_paths = [
+                str(p)
+                for p in Path(dataset_dir).rglob("*")
+                if p.is_file()
+            ]
             if not file_paths:
                 raise ValueError("No files found in selected folder.")
 
-            rows = benchmark_files_parallel(
-                file_paths=file_paths,
-                repeats=repeats,
-                include_blake2=include_blake2,
-            )
-            issues = validate_consistency(rows)
-            summary = summarize_rows(rows)
+            report = benchmark_files(file_paths, rounds=repeats)
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_json = os.path.join(dataset_dir, f"blake3_benchmark_{ts}.json")
             output_csv = os.path.join(dataset_dir, f"blake3_benchmark_{ts}.csv")
-            write_benchmark_csv(rows, output_csv)
+            Path(output_json).write_text(json.dumps(report, indent=2), encoding="utf-8")
+            _write_csv(output_csv, report["runs"])
 
-            self.after(0, lambda: self._on_benchmark_success(summary, issues, output_csv, len(file_paths), repeats))
+            self.after(0, lambda: self._on_benchmark_success(
+                report["summary"], output_csv, output_json, len(file_paths), repeats
+            ))
         except Exception as exc:
             self.after(0, lambda: self._on_benchmark_error(str(exc)))
 
     def _on_benchmark_success(
         self,
-        summary: dict[str, dict[str, float]],
-        issues: list[str],
+        summary: list,
         output_csv: str,
+        output_json: str,
         file_count: int,
         repeats: int,
     ) -> None:
         self._busy = False
-        simd_info = get_simd_summary()
+        simd_info = detected_simd_tier()
         lines = [
             f"Files processed: {file_count}",
             f"Repeats/file: {repeats}",
             f"SIMD tier: {simd_info}",
             "",
-            "Average Results:",
+            "Median Throughput by Category & Algorithm:",
         ]
 
-        for key in sorted(summary.keys()):
-            stats = summary[key]
+        for entry in summary:
             lines.append(
-                (
-                    f"{key} -> runs={int(stats['runs'])}, "
-                    f"elapsed={stats['avg_elapsed_s']:.4f}s, "
-                    f"throughput={stats['avg_throughput_mb_s']:.2f} MB/s "
-                    f"(±{stats['stddev_throughput_mb_s']:.2f}, "
-                    f"min={stats['min_throughput_mb_s']:.2f}, "
-                    f"max={stats['max_throughput_mb_s']:.2f}), "
-                    f"cpu={stats['avg_cpu_percent']:.2f}%, "
-                    f"mem={stats['avg_memory_mb']:.2f} MB"
-                )
+                f"  [{entry['category']}] {entry['algorithm']}: "
+                f"{entry['median_throughput_mb_s']:.2f} MB/s  "
+                f"(median {entry['median_elapsed_ms']:.1f} ms, {entry['runs']} runs)"
             )
 
         lines.append("")
-        lines.append("Consistency check:")
-        if issues:
-            lines.extend([f"- {issue}" for issue in issues])
-        else:
-            lines.append("No digest consistency issues detected.")
-
-        lines.append("")
-        lines.append(f"CSV saved to: {output_csv}")
+        lines.append(f"CSV:  {output_csv}")
+        lines.append(f"JSON: {output_json}")
 
         self._set_summary("\n".join(lines))
         self.status_var.set("Benchmark complete")
